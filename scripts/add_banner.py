@@ -29,47 +29,91 @@ BANNER_BEGIN = "<!-- aux-rescue-banner: begin -->"
 BANNER_END = "<!-- aux-rescue-banner: end -->"
 
 
-def render_banner(marker: dict, symptom: str | None = None) -> str:
-    """Render the banner from a marker dict."""
-    rescued_date = marker.get("rescued_at", "")[:10]  # YYYY-MM-DD
-    source = marker.get("source", "<unknown source>")
-    count = marker.get("tensor_count", 0)
-    prefixes = marker.get("include_prefix") or []
-    prefix_desc = ", ".join(f"`{p}*`" for p in prefixes) if prefixes else "auxiliary"
+def render_banner(
+    marker: dict,
+    symptom: str | None = None,
+    marker_source: str | None = None,
+) -> str:
+    """Render the banner from a marker dict.
+
+    Accepts both ``.aux_rescue.json`` (lost-aux-tensor rescue) and
+    ``.moe_fuse.json`` (fused-MoE round-trip repair) shapes.
+    """
+    is_moe = marker.get("tool") == "moe-fuse" or marker_source == ".moe_fuse.json"
     homepage = marker.get("homepage", "https://github.com/timrohrbaugh/aux-rescue")
+    source = marker.get("source", "<unknown source>")
     out_file = marker.get("out_file", "model-auxiliary.safetensors")
 
-    if symptom is None:
-        symptom = (
-            "Affected workflows that depend on these tensors will fail to "
-            "load. Other workflows were unaffected."
-        )
+    if is_moe:
+        date = marker.get("fused_at", "")[:10]
+        n_layers = marker.get("layers_fused", 0)
+        n_tensors = marker.get("tensors_fused", 0)
+        if symptom is None:
+            symptom = (
+                "The LM body's MoE expert weights had been saved as "
+                "per-expert nn.Linear tensors and could not be reloaded by "
+                "the model class — the fused 3D parameters re-initialised "
+                "to random at load time, producing garbage output."
+            )
+        body = [
+            f"> ## ⚠️ Update {date} — please re-pull this model",
+            ">",
+            f"> An earlier upload of this repo had its MoE expert weights in",
+            "> per-expert (unfused) form: separate `experts.{N}.gate_proj.weight`,",
+            "> `up_proj.weight`, `down_proj.weight` instead of the fused 3D",
+            "> `experts.gate_up_proj` / `experts.down_proj` tensors the loader",
+            "> expects. PEFT/LoRA wrapping during abliteration converts fused",
+            "> 3D tensors into per-expert Linear modules; `merge_and_unload` +",
+            "> `save_pretrained` then writes them in that wrong layout.",
+            ">",
+            f"> **Symptom:** {symptom}",
+            ">",
+            f"> **Status:** fixed on {date} by re-fusing the per-expert tensors",
+            f"> back into 3D form ({n_layers} layers, {n_tensors} fused tensors)",
+            "> and patching `model.safetensors.index.json`. The repo now carries",
+            "> a `.moe_fuse.json` marker file so this fact is programmatically",
+            "> verifiable. The original per-expert keys remain in the main shards",
+            "> as harmless 'unexpected' keys at load time.",
+            ">",
+            f"> Source used for shape reference: [`{source}`](https://huggingface.co/{source})",
+            "> (heretic's abliteration is preserved — fusion uses the dest's",
+            "> per-expert weights, not source's).",
+            ">",
+            f"> If you cloned this repo before {date}, please pull again.",
+            f"> Repaired with [`moe-fuse`]({homepage}).",
+        ]
+    else:
+        date = marker.get("rescued_at", "")[:10]
+        count = marker.get("tensor_count", 0)
+        prefixes = marker.get("include_prefix") or []
+        prefix_desc = ", ".join(f"`{p}*`" for p in prefixes) if prefixes else "auxiliary"
+        if symptom is None:
+            symptom = (
+                "Affected workflows that depend on these tensors will fail to "
+                "load. Other workflows were unaffected."
+            )
+        body = [
+            f"> ## ⚠️ Update {date} — please re-pull this model",
+            ">",
+            f"> An earlier upload of this repo was missing {prefix_desc} weights",
+            f"> ({count} tensors) due to a bug in `save_pretrained`: tensors not",
+            "> registered in the loaded model class's `state_dict()` were silently",
+            "> dropped on save.",
+            ">",
+            f"> **Symptom:** {symptom}",
+            ">",
+            f"> **Status:** fixed on {date} by uploading `{out_file}` and",
+            "> patching `model.safetensors.index.json`. The repo now carries an",
+            "> `.aux_rescue.json` marker file so this fact is programmatically",
+            "> verifiable.",
+            ">",
+            f"> Source used for restoration: [`{source}`](https://huggingface.co/{source})",
+            ">",
+            f"> If you cloned this repo before {date}, please pull again.",
+            f"> Repaired with [`aux-rescue`]({homepage}).",
+        ]
 
-    lines = [
-        BANNER_BEGIN,
-        "",
-        f"> ## ⚠️ Update {rescued_date} — please re-pull this model",
-        ">",
-        f"> An earlier upload of this repo was missing {prefix_desc} weights",
-        f"> ({count} tensors) due to a bug in `save_pretrained`: tensors not",
-        "> registered in the loaded model class's `state_dict()` were silently",
-        "> dropped on save.",
-        ">",
-        f"> **Symptom:** {symptom}",
-        ">",
-        f"> **Status:** fixed on {rescued_date} by uploading `{out_file}` and",
-        "> patching `model.safetensors.index.json`. The repo now carries an",
-        "> `.aux_rescue.json` marker file so this fact is programmatically",
-        "> verifiable.",
-        ">",
-        f"> Source used for restoration: [`{source}`](https://huggingface.co/{source})",
-        ">",
-        f"> If you cloned this repo before {rescued_date}, please pull again.",
-        f"> Repaired with [`aux-rescue`]({homepage}).",
-        "",
-        BANNER_END,
-    ]
-    return "\n".join(lines) + "\n"
+    return "\n".join([BANNER_BEGIN, ""] + body + ["", BANNER_END]) + "\n"
 
 
 def insert_or_replace(readme: str, banner_block: str) -> str:
@@ -137,13 +181,19 @@ def main(argv: list[str] | None = None) -> int:
         new_readme = remove_banner(readme)
         commit_msg = "aux-rescue: remove banner"
     else:
-        marker: dict
-        try:
-            marker_path = hf_hub_download(
-                args.repo, ".aux_rescue.json", token=token,
-            )
-            marker = json.loads(Path(marker_path).read_text())
-        except Exception:
+        marker: dict | None = None
+        marker_source: str | None = None
+        for marker_name in (".aux_rescue.json", ".moe_fuse.json"):
+            try:
+                marker_path = hf_hub_download(
+                    args.repo, marker_name, token=token,
+                )
+                marker = json.loads(Path(marker_path).read_text())
+                marker_source = marker_name
+                break
+            except Exception:
+                continue
+        if marker is None:
             from datetime import datetime, timezone
             if not (args.source and args.include_prefix and args.tensor_count):
                 print(
@@ -163,12 +213,18 @@ def main(argv: list[str] | None = None) -> int:
                 "out_file": "model-auxiliary.safetensors",
                 "homepage": "https://github.com/timrohrbaugh/aux-rescue",
             }
-        banner = render_banner(marker, symptom=args.symptom)
+        banner = render_banner(marker, symptom=args.symptom, marker_source=marker_source)
         new_readme = insert_or_replace(readme, banner)
+        n_for_msg = (
+            marker.get("tensors_fused")
+            or marker.get("tensor_count")
+            or "?"
+        )
+        tool = "moe-fuse" if marker_source == ".moe_fuse.json" else "aux-rescue"
         commit_msg = (
-            f"aux-rescue: refresh banner ({marker.get('tensor_count', '?')} tensors)"
+            f"{tool}: refresh banner ({n_for_msg} tensors)"
             if BANNER_BEGIN in readme
-            else f"aux-rescue: add banner ({marker.get('tensor_count', '?')} tensors)"
+            else f"{tool}: add banner ({n_for_msg} tensors)"
         )
 
     if new_readme == readme:
