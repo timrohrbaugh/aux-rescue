@@ -1,6 +1,6 @@
 [project]
 name = "aux-rescue"
-version = "0.1.0"
+version = "0.1.1"
 description = "Restore auxiliary safetensors weights (MTP, EAGLE, Medusa, vision/audio encoders) that AutoModelForCausalLM.save_pretrained silently drops"
 readme = "README.md"
 license = "Apache-2.0"

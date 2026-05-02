@@ -60,18 +60,24 @@ def _suggest_next_steps(
     suggestions.append("=" * 78)
 
     if report.likely_rename_present:
-        # Compute prefix overlap between orphan groups and dest-only groups.
-        # If they share a prefix, the orphans under that prefix are NOT
-        # missing — they're renamed.
-        orphan_groups = report.prefix_groups(depth=2)
-        dest_only_groups: dict[str, int] = {}
-        for k in report.dest_only_keys:
-            parts = k.split(".")
-            pfx = ".".join(parts[:2]) if len(parts) >= 2 else k
-            dest_only_groups[pfx] = dest_only_groups.get(pfx, 0) + 1
+        # Group at depth=1 (top-level module). A top-level prefix is "clean"
+        # if no dest-only key starts with it. This is the most reliable
+        # rename heuristic: when source has `mtp.*` and dest has `model.*`,
+        # `mtp.` has no dest-only sibling so it's safe to rescue, while
+        # `model.*` overlaps and is excluded.
+        orphan_tops: dict[str, int] = {}
+        for k in report.orphan_keys:
+            top = k.split(".", 1)[0]
+            orphan_tops[top] = orphan_tops.get(top, 0) + 1
 
-        renamed_prefixes = set(orphan_groups) & set(dest_only_groups)
-        clean_prefixes = [p for p in orphan_groups if p not in renamed_prefixes]
+        dest_only_tops: set[str] = {
+            k.split(".", 1)[0] for k in report.dest_only_keys
+        }
+
+        renamed_tops = set(orphan_tops) & dest_only_tops
+        clean_tops = [t for t in orphan_tops if t not in dest_only_tops]
+        excluded_count = sum(orphan_tops[t] for t in renamed_tops)
+        included_count = sum(orphan_tops[t] for t in clean_tops)
 
         suggestions.append(
             "\nThe dest has tensor names that aren't in the source. This "
@@ -84,18 +90,19 @@ def _suggest_next_steps(
             "      level of a subtree."
         )
 
-        if renamed_prefixes:
+        if renamed_tops:
             suggestions.append("")
             suggestions.append(
                 f"Detected likely rename in: "
-                f"{', '.join(sorted(renamed_prefixes))}.*"
+                f"{', '.join(sorted(t + '.*' for t in renamed_tops))} "
+                f"({excluded_count} tensor(s) excluded from rescue)"
             )
             suggestions.append(
                 "Do NOT rescue these prefixes — the weights are already in "
                 "dest under different names."
             )
 
-        if not clean_prefixes:
+        if not clean_tops:
             suggestions.append("")
             suggestions.append(
                 "All orphan groups overlap with renamed dest keys. There "
@@ -114,12 +121,11 @@ def _suggest_next_steps(
         else:
             suggestions.append("")
             suggestions.append(
-                "Safe to rescue ONLY the prefixes below (no dest-only "
-                "overlap):"
+                f"Safe to rescue {included_count} tensor(s) under "
+                f"{len(clean_tops)} top-level prefix(es) "
+                f"(no dest-only overlap):"
             )
-            cmd_parts = []
-            for p in clean_prefixes[:3]:
-                cmd_parts.append(f"--include-prefix {p}.")
+            cmd_parts = [f"--include-prefix {t}." for t in clean_tops]
             cmd_with_filter = list(fix_cmd) + cmd_parts
             suggestions.append("")
             suggestions.append("    " + " ".join(cmd_with_filter))
@@ -142,8 +148,15 @@ def _suggest_next_steps(
         local_cmd = ["aux-rescue", "--source", _quote(args.source),
                      "--dest", "./local-copy"]
         if report.likely_rename_present:
-            for p in list(report.prefix_groups(depth=2).keys())[:1]:
-                local_cmd += [f"--include-prefix {p}."]
+            dest_only_tops = {
+                k.split(".", 1)[0] for k in report.dest_only_keys
+            }
+            clean_tops = [
+                k.split(".", 1)[0] for k in report.orphan_keys
+                if k.split(".", 1)[0] not in dest_only_tops
+            ]
+            for t in dict.fromkeys(clean_tops):
+                local_cmd += [f"--include-prefix {t}."]
         suggestions.append("    " + " ".join(local_cmd))
         suggestions.append(
             "    # then push back: huggingface-cli upload "
