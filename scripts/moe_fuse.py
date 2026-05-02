@@ -220,7 +220,14 @@ def fuse_one_layer(
     dst_idx: dict,
     token: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Build (gate_up_fused, down_fused) for one layer from per-expert tensors."""
+    """Build (gate_up_fused, down_fused) for one layer from per-expert tensors.
+
+    Returns None if the dest does not contain the per-expert tensors for this
+    layer.  This is not fatal: the caller skips the layer.  Common case: the
+    layer is an MTP draft head whose source has fused experts but heretic
+    didn't save it (it's an aux-rescue case, not a fusion case) — those will
+    have to be aux-rescued separately.
+    """
     gates: list[torch.Tensor] = []
     ups: list[torch.Tensor] = []
     downs: list[torch.Tensor] = []
@@ -239,8 +246,9 @@ def fuse_one_layer(
         )
         if g is None or u is None or d is None:
             print(
-                f"  ERROR: missing per-expert tensor at {plan.parent_prefix}{e}; "
-                f"cannot fuse this layer"
+                f"  SKIP: per-expert tensor missing at {plan.parent_prefix}{e} "
+                f"in dest; this layer can't be fused (likely an aux-rescue "
+                f"target — try aux-rescue --include-prefix {plan.parent_prefix.split('.')[0]}.)"
             )
             return None
         gates.append(g)
@@ -379,6 +387,7 @@ def main(argv: list[str] | None = None) -> int:
         from huggingface_hub import upload_file
 
     written_keys_to_file: dict[str, str] = {}
+    skipped_layers: list[str] = []
     t0 = time.time()
     for chunk_idx in range(n_chunks):
         chunk_plans = plans[chunk_idx * args.chunk_layers : (chunk_idx + 1) * args.chunk_layers]
@@ -395,13 +404,17 @@ def main(argv: list[str] | None = None) -> int:
                   f"({plan.num_experts} experts)...", flush=True)
             out = fuse_one_layer(plan, args.dest, dst_idx, token=token)
             if out is None:
-                print("ABORT: per-expert tensor missing. Run --check first.")
-                return 2
+                skipped_layers.append(plan.parent_prefix)
+                continue
             gate_up, down = out
             chunk_tensors[plan.gate_up_key] = gate_up.contiguous()
             chunk_tensors[plan.down_key] = down.contiguous()
             for k in (plan.gate_up_key, plan.down_key):
                 written_keys_to_file[k] = chunk_name
+
+        if not chunk_tensors:
+            print(f"  (chunk has no fuseable layers; skipping write)")
+            continue
 
         if dst_local:
             out_path = Path(args.dest) / chunk_name
@@ -420,9 +433,17 @@ def main(argv: list[str] | None = None) -> int:
                     commit_message=f"moe-fuse: chunk {chunk_idx + 1}/{n_chunks} "
                                    f"({len(chunk_tensors)} tensors)",
                 )
-        # Free chunk memory before next iteration.
         chunk_tensors.clear()
         import gc; gc.collect()
+
+    if skipped_layers:
+        print(f"\nSkipped {len(skipped_layers)} layer(s) (per-expert tensors "
+              f"missing in dest):")
+        for p in skipped_layers[:5]:
+            print(f"  {p}")
+        if len(skipped_layers) > 5:
+            print(f"  ... and {len(skipped_layers) - 5} more")
+        print("These need aux-rescue (not moe-fuse) to be restored.")
 
     print(f"\nFused all {len(written_keys_to_file)} tensors in "
           f"{time.time() - t0:.1f}s across {n_chunks} chunk(s)")

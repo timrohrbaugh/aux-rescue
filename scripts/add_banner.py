@@ -117,18 +117,22 @@ def render_banner(
 
 
 def insert_or_replace(readme: str, banner_block: str) -> str:
-    """Insert banner just after frontmatter, or replace existing banner."""
-    if BANNER_BEGIN in readme and BANNER_END in readme:
-        pattern = re.compile(
-            re.escape(BANNER_BEGIN) + r".*?" + re.escape(BANNER_END) + r"\n?",
-            flags=re.DOTALL,
-        )
-        return pattern.sub(banner_block, readme, count=1)
+    """Insert banner just after frontmatter, or replace existing banner(s).
 
-    parts = readme.split("---\n", 2)
+    Removes ALL existing aux-rescue/moe-fuse banner blocks before inserting,
+    so refreshes never accumulate stale blocks.
+    """
+    pattern = re.compile(
+        re.escape(BANNER_BEGIN) + r".*?" + re.escape(BANNER_END) + r"\n?",
+        flags=re.DOTALL,
+    )
+    cleaned = pattern.sub("", readme)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+
+    parts = cleaned.split("---\n", 2)
     if len(parts) == 3 and parts[0].strip() == "":
         return "---\n" + parts[1] + "---\n\n" + banner_block + "\n" + parts[2].lstrip("\n")
-    return banner_block + "\n" + readme
+    return banner_block + "\n" + cleaned
 
 
 def remove_banner(readme: str) -> str:
@@ -181,18 +185,20 @@ def main(argv: list[str] | None = None) -> int:
         new_readme = remove_banner(readme)
         commit_msg = "aux-rescue: remove banner"
     else:
-        marker: dict | None = None
-        marker_source: str | None = None
+        markers: list[tuple[str, dict]] = []
         for marker_name in (".aux_rescue.json", ".moe_fuse.json"):
             try:
                 marker_path = hf_hub_download(
                     args.repo, marker_name, token=token,
                 )
-                marker = json.loads(Path(marker_path).read_text())
-                marker_source = marker_name
-                break
+                markers.append((
+                    marker_name, json.loads(Path(marker_path).read_text())
+                ))
             except Exception:
                 continue
+
+        marker: dict | None = markers[0][1] if markers else None
+        marker_source: str | None = markers[0][0] if markers else None
         if marker is None:
             from datetime import datetime, timezone
             if not (args.source and args.include_prefix and args.tensor_count):
@@ -213,18 +219,23 @@ def main(argv: list[str] | None = None) -> int:
                 "out_file": "model-auxiliary.safetensors",
                 "homepage": "https://github.com/timrohrbaugh/aux-rescue",
             }
-        banner = render_banner(marker, symptom=args.symptom, marker_source=marker_source)
+        if len(markers) > 1:
+            banner_blocks = [
+                render_banner(m, symptom=args.symptom, marker_source=src)
+                for src, m in markers
+            ]
+            banner = "\n".join(banner_blocks)
+        else:
+            banner = render_banner(marker, symptom=args.symptom, marker_source=marker_source)
         new_readme = insert_or_replace(readme, banner)
-        n_for_msg = (
-            marker.get("tensors_fused")
-            or marker.get("tensor_count")
-            or "?"
+        tool_summary = "+".join(
+            "moe-fuse" if src == ".moe_fuse.json" else "aux-rescue"
+            for src, _ in markers
         )
-        tool = "moe-fuse" if marker_source == ".moe_fuse.json" else "aux-rescue"
         commit_msg = (
-            f"{tool}: refresh banner ({n_for_msg} tensors)"
+            f"{tool_summary}: refresh banner"
             if BANNER_BEGIN in readme
-            else f"{tool}: add banner ({n_for_msg} tensors)"
+            else f"{tool_summary}: add banner"
         )
 
     if new_readme == readme:
