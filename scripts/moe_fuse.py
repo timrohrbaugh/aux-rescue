@@ -328,6 +328,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--check", action="store_true")
     p.add_argument("--token", default=None)
     p.add_argument("--out-name", default=FUSED_OUT_NAME)
+    p.add_argument("--chunk-layers", type=int, default=10,
+                   help="Layers per output file (memory ceiling). "
+                        "Default: %(default)s. Larger MoE models need lower "
+                        "values to avoid OOM (e.g. 5 for 122B-A10B).")
     args = p.parse_args(argv)
 
     from huggingface_hub import get_token
@@ -365,50 +369,82 @@ def main(argv: list[str] | None = None) -> int:
 
     dst_idx = _read_index(args.dest, token=token).get("weight_map", {})
 
-    fused_tensors: dict[str, torch.Tensor] = {}
-    t0 = time.time()
-    for i, plan in enumerate(plans, 1):
-        print(f"  [{i}/{len(plans)}] fusing {plan.parent_prefix}* "
-              f"({plan.num_experts} experts)...", flush=True)
-        out = fuse_one_layer(plan, args.dest, dst_idx, token=token)
-        if out is None:
-            print("ABORT: per-expert tensor missing. Run --check first.")
-            return 2
-        gate_up, down = out
-        fused_tensors[plan.gate_up_key] = gate_up.contiguous()
-        fused_tensors[plan.down_key] = down.contiguous()
-    print(f"Fused {len(fused_tensors)} tensors in {time.time()-t0:.1f}s")
+    n_chunks = (len(plans) + args.chunk_layers - 1) // args.chunk_layers
+    print(f"Will write {n_chunks} chunk file(s), {args.chunk_layers} layers each "
+          f"(--chunk-layers={args.chunk_layers}).")
 
     if dst_local:
-        out_path = Path(args.dest) / args.out_name
-        print(f"\nWriting {out_path}...")
-        save_file(fused_tensors, str(out_path))
-        patch_local_index(args.dest, args.out_name, list(fused_tensors.keys()))
+        from huggingface_hub import upload_file as _unused  # noqa
+    else:
+        from huggingface_hub import upload_file
+
+    written_keys_to_file: dict[str, str] = {}
+    t0 = time.time()
+    for chunk_idx in range(n_chunks):
+        chunk_plans = plans[chunk_idx * args.chunk_layers : (chunk_idx + 1) * args.chunk_layers]
+        chunk_name = (
+            args.out_name if n_chunks == 1
+            else args.out_name.replace(".safetensors", f"-{chunk_idx:03d}.safetensors")
+        )
+        print(f"\n[chunk {chunk_idx + 1}/{n_chunks}] {chunk_name}: "
+              f"{len(chunk_plans)} layers")
+
+        chunk_tensors: dict[str, torch.Tensor] = {}
+        for i, plan in enumerate(chunk_plans, 1):
+            print(f"  [{i}/{len(chunk_plans)}] fusing {plan.parent_prefix}* "
+                  f"({plan.num_experts} experts)...", flush=True)
+            out = fuse_one_layer(plan, args.dest, dst_idx, token=token)
+            if out is None:
+                print("ABORT: per-expert tensor missing. Run --check first.")
+                return 2
+            gate_up, down = out
+            chunk_tensors[plan.gate_up_key] = gate_up.contiguous()
+            chunk_tensors[plan.down_key] = down.contiguous()
+            for k in (plan.gate_up_key, plan.down_key):
+                written_keys_to_file[k] = chunk_name
+
+        if dst_local:
+            out_path = Path(args.dest) / chunk_name
+            print(f"  writing {out_path}...")
+            save_file(chunk_tensors, str(out_path))
+        else:
+            print(f"  uploading {chunk_name} to {args.dest}...")
+            with tempfile.TemporaryDirectory() as td:
+                tmp_path = Path(td) / chunk_name
+                save_file(chunk_tensors, str(tmp_path))
+                upload_file(
+                    path_or_fileobj=str(tmp_path),
+                    path_in_repo=chunk_name,
+                    repo_id=_hub_repo(args.dest),
+                    token=token,
+                    commit_message=f"moe-fuse: chunk {chunk_idx + 1}/{n_chunks} "
+                                   f"({len(chunk_tensors)} tensors)",
+                )
+        # Free chunk memory before next iteration.
+        chunk_tensors.clear()
+        import gc; gc.collect()
+
+    print(f"\nFused all {len(written_keys_to_file)} tensors in "
+          f"{time.time() - t0:.1f}s across {n_chunks} chunk(s)")
+
+    print("Patching index...")
+    if dst_local:
+        idx_path = Path(args.dest) / INDEX_NAME
+        idx = json.loads(idx_path.read_text()) if idx_path.exists() else {"weight_map": {}, "metadata": {}}
+        wm = idx.setdefault("weight_map", {})
+        for k, fname in written_keys_to_file.items():
+            wm[k] = fname
+        idx_path.write_text(json.dumps(idx, indent=2))
         write_marker(
             dest_dir=args.dest, repo_id=None, source=args.source,
             plans=plans, out_name=args.out_name,
         )
-        print(f"DONE. Wrote {len(fused_tensors)} fused tensors to {out_path}")
-        print(f"      Patched {INDEX_NAME}")
-        print(f"      Wrote .moe_fuse.json marker")
+        print(f"DONE. Patched {INDEX_NAME}, wrote .moe_fuse.json")
     else:
-        from huggingface_hub import upload_file
-        print(f"\nUploading {args.out_name} to {args.dest}...")
-        with tempfile.TemporaryDirectory() as td:
-            tmp_path = Path(td) / args.out_name
-            save_file(fused_tensors, str(tmp_path))
-            upload_file(
-                path_or_fileobj=str(tmp_path),
-                path_in_repo=args.out_name,
-                repo_id=_hub_repo(args.dest),
-                token=token,
-                commit_message=f"moe-fuse: restore fused MoE layout ({len(fused_tensors)} tensors)",
-            )
-        # Patch the index.
         idx = _read_index(args.dest, token=token)
         wm = idx.setdefault("weight_map", {})
-        for k in fused_tensors:
-            wm[k] = args.out_name
+        for k, fname in written_keys_to_file.items():
+            wm[k] = fname
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             f.write(json.dumps(idx, indent=2))
             ip = f.name
@@ -417,13 +453,13 @@ def main(argv: list[str] | None = None) -> int:
             path_in_repo=INDEX_NAME,
             repo_id=_hub_repo(args.dest),
             token=token,
-            commit_message=f"moe-fuse: register {len(fused_tensors)} fused MoE keys in index",
+            commit_message=f"moe-fuse: register {len(written_keys_to_file)} fused keys",
         )
         write_marker(
             dest_dir=None, repo_id=_hub_repo(args.dest), source=args.source,
             plans=plans, out_name=args.out_name, token=token,
         )
-        print(f"DONE. Uploaded {args.out_name}, patched {INDEX_NAME}, wrote .moe_fuse.json")
+        print(f"DONE. Patched {INDEX_NAME}, wrote .moe_fuse.json")
 
     return 0
 
