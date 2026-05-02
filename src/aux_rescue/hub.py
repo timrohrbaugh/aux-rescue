@@ -8,8 +8,10 @@ from pathlib import Path
 from aux_rescue.core import (
     AUX_OUT_NAME,
     INDEX_NAME,
+    MARKER_NAME,
     OrphanReport,
     _hub_repo,
+    build_marker,
     diff_orphans,
     extract_orphans,
     write_aux_file,
@@ -101,8 +103,28 @@ def rescue_hub(
         commit_message=f"aux-rescue: register {len(extracted)} aux key(s) in index",
     )
 
+    marker = build_marker(
+        source=source,
+        rescued_keys=list(extracted.keys()),
+        include_prefix=include_prefix,
+        exclude_prefix=exclude_prefix,
+        out_name=out_name,
+    )
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".json", delete=False,
+    ) as fout:
+        fout.write(json.dumps(marker, indent=2))
+        marker_path = fout.name
+    upload_file(
+        path_or_fileobj=marker_path,
+        path_in_repo=MARKER_NAME,
+        repo_id=repo,
+        token=token,
+        commit_message=f"aux-rescue: write {MARKER_NAME} marker",
+    )
+
     print(
-        f"rescued {len(extracted)} tensor(s) onto {repo} as {out_name} "
-        f"and patched {INDEX_NAME}"
+        f"rescued {len(extracted)} tensor(s) onto {repo} as {out_name}, "
+        f"patched {INDEX_NAME}, wrote {MARKER_NAME}"
     )
     return report

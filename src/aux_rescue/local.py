@@ -6,7 +6,9 @@ from pathlib import Path
 from aux_rescue.core import (
     AUX_OUT_NAME,
     INDEX_NAME,
+    MARKER_NAME,
     OrphanReport,
+    build_marker,
     diff_orphans,
     extract_orphans,
     patch_local_index,
@@ -61,8 +63,18 @@ def rescue_local(
     write_aux_file(extracted, out_path)
     patch_local_index(dst, out_name, list(extracted.keys()))
 
+    import json
+    marker = build_marker(
+        source=source,
+        rescued_keys=list(extracted.keys()),
+        include_prefix=include_prefix,
+        exclude_prefix=exclude_prefix,
+        out_name=out_name,
+    )
+    (dst / MARKER_NAME).write_text(json.dumps(marker, indent=2))
+
     print(
         f"rescued {len(extracted)} tensor(s) into {out_path} "
-        f"and registered them in {INDEX_NAME}"
+        f"and registered them in {INDEX_NAME}; wrote {MARKER_NAME}"
     )
     return report

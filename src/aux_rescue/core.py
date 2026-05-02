@@ -26,6 +26,36 @@ from pathlib import Path
 AUX_OUT_NAME = "model-auxiliary.safetensors"
 INDEX_NAME = "model.safetensors.index.json"
 SINGLE_NAME = "model.safetensors"
+MARKER_NAME = ".aux_rescue.json"
+
+
+def build_marker(
+    source: str,
+    rescued_keys: list[str],
+    include_prefix: list[str] | None,
+    exclude_prefix: list[str] | None,
+    out_name: str,
+) -> dict:
+    """Build the contents of the ``.aux_rescue.json`` marker file.
+
+    Written into rescued repos so downstream users (and tools) can detect
+    that a rescue was applied, what was restored, and from where.
+    """
+    from datetime import datetime, timezone
+    from aux_rescue import __version__
+
+    return {
+        "tool": "aux-rescue",
+        "version": __version__,
+        "homepage": "https://github.com/timrohrbaugh/aux-rescue",
+        "rescued_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "source": source,
+        "out_file": out_name,
+        "tensor_count": len(rescued_keys),
+        "include_prefix": include_prefix or [],
+        "exclude_prefix": exclude_prefix or [],
+        "sample_keys": rescued_keys[:10],
+    }
 
 
 @dataclass
